@@ -10,11 +10,17 @@ import pytesseract
 from PIL import Image
 import io
 import subprocess
+import sys
+
+# Força logs para stdout para facilitar depuração no Docker
+import logging
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logger = logging.getLogger("MarkItDownAPI")
 
 app = FastAPI(
     title="MarkItDown API",
     description="Converte qualquer documento suportado pelo MarkItDown em Markdown",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 # 🔐 API KEY via ENV
@@ -45,8 +51,22 @@ def run_ocr(contents: bytes) -> str:
         text = pytesseract.image_to_string(image, lang='por+eng')
         return text.strip()
     except Exception as e:
-        print(f"Erro no OCR: {e}")
+        logger.error(f"Erro no OCR: {e}")
         return ""
+
+def run_antiword_conversion(input_path: str) -> str:
+    """Fallback direto para Antiword (extrai texto de .doc binário)."""
+    try:
+        result = subprocess.run(
+            ["antiword", input_path],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception as e:
+        logger.error(f"Erro no Antiword: {e}")
+    return ""
 
 def run_pandoc_conversion(input_path: str) -> str:
     """Fallback para converter via Pandoc (especialmente arquivos .doc legados)."""
@@ -70,11 +90,11 @@ def run_pandoc_conversion(input_path: str) -> str:
         if result.returncode == 0:
             return result.stdout.strip()
     except Exception as e:
-        print(f"Erro no Pandoc: {e}")
+        logger.error(f"Erro no Pandoc: {e}")
     return ""
 
 def perform_conversion(contents: bytes, filename: str, mimetype: str):
-    """Lógica central de conversão com fallbacks (MarkItDown -> Pandoc -> OCR)."""
+    """Lógica central de conversão com múltiplos fallbacks (Waterfall)."""
     if len(contents) == 0:
         raise HTTPException(400, "Arquivo vazio")
 
@@ -87,7 +107,7 @@ def perform_conversion(contents: bytes, filename: str, mimetype: str):
     ext = get_extension(filename, mimetype).lower()
     suffix = ext if ext.startswith(".") else f".{ext}" if ext else ""
     
-    is_image = mimetype.startswith("image/") or ext in [".png", ".jpg", ".jpeg", ".tiff", ".bmp"]
+    is_image = mimetype.startswith("image/") or ext in [".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"]
     is_legacy_word = ext == ".doc" or mimetype == "application/msword"
     
     markdown = ""
@@ -98,48 +118,60 @@ def perform_conversion(contents: bytes, filename: str, mimetype: str):
         tmp_path = tmp_file.name
 
     try:
-        # Se for Word legado, Pandoc costuma ser melhor que MarkItDown
-        if is_legacy_word:
-            markdown = run_pandoc_conversion(tmp_path)
-            if markdown:
-                method = "pandoc"
-
-        # Tenta conversão via MarkItDown se não conseguimos via pandoc ou se não é doc legado
-        if not markdown:
+        # 1. Tenta MarkItDown (Melhor fidelidade para formatos modernos)
+        if not is_legacy_word:
             try:
                 result = md.convert(tmp_path)
                 markdown = result.text_content.strip() if result else ""
                 if markdown:
                     method = "markitdown"
-            except Exception:
-                # Se falhar e não for imagem, tentamos pandoc como último recurso antes de desistir
-                if not is_image:
-                    markdown = run_pandoc_conversion(tmp_path)
-                    if markdown:
-                        method = "pandoc"
+            except Exception as e:
+                logger.warning(f"MarkItDown falhou para {filename}: {e}")
+
+        # 2. Tenta Pandoc (Excelente para .doc e fallbacks de PDF/Office)
+        if not markdown:
+            markdown = run_pandoc_conversion(tmp_path)
+            if markdown:
+                method = "pandoc"
+            else:
+                logger.warning(f"Pandoc falhou para {filename}")
+
+        # 3. Tenta Antiword Direto (Específico para .doc se Pandoc falhou)
+        if not markdown and is_legacy_word:
+            markdown = run_antiword_conversion(tmp_path)
+            if markdown:
+                method = "antiword"
+                logger.info(f"Fallback Antiword funcionou para {filename}")
+
+        # 4. Fallback final para OCR (Se for imagem ou se tudo falhar e o arquivo for pequeno o suficiente)
+        # Às vezes PDFs sem texto são melhor lidos via OCR de primeira página (simificado como imagem aqui)
+        if is_image and (not markdown or len(markdown) < 10):
+            ocr_text = run_ocr(contents)
+            if ocr_text:
+                markdown = ocr_text
+                method = "ocr"
+
     except Exception as e:
+        logger.error(f"Erro fatal na conversão de {filename}: {e}")
         if not is_image:
             raise HTTPException(
                 status_code=500,
-                detail={"message": "Erro ao converter arquivo", "error": str(e)}
+                detail={"message": "Erro inesperado ao converter arquivo", "error": str(e)}
             )
     finally:
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-    # Fallback para OCR se for imagem e nada funcionou
-    if is_image and (not markdown or len(markdown) < 10):
-        ocr_text = run_ocr(contents)
-        if ocr_text:
-            markdown = ocr_text
-            method = "ocr"
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
 
     if not markdown:
         raise HTTPException(
             status_code=422,
-            detail="Conversão falhou: formato não suportado ou arquivo sem conteúdo extraível."
+            detail="Conversão falhou: todos os motores falharam ou o arquivo não contém texto extraível."
         )
 
+    logger.info(f"Sucesso: {filename} convertido via {method}")
     return {
         "filename": filename,
         "content_type": mimetype,

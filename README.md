@@ -70,6 +70,18 @@ Uma API robusta baseada em FastAPI para converter qualquer documento em Markdown
   ```
 - **Header**: `x-api-key: SUA_CHAVE`.
 
+**Exemplo com cURL:**
+```bash
+curl -X POST "http://localhost:8000/convert-base64" \
+     -H "x-api-key: SUA_CHAVE_AQUI" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "filename": "documento.pdf",
+           "mimetype": "application/pdf",
+           "base64_content": "JVBERi0xLjQK..."
+         }'
+```
+
 ## 🧠 OCR (Reconhecimento de Texto)
 
 A API detecta automaticamente quando um arquivo é uma imagem ou um PDF sem texto extraível e aciona o Tesseract OCR (Português/Inglês) para garantir que o conteúdo seja recuperado.
