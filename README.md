@@ -33,10 +33,10 @@ Uma API robusta baseada em FastAPI para converter qualquer documento em Markdown
 
 ## ✨ Funcionalidades
 
-- **Múltiplos Formatos**: Suporta Office (Word, Excel, PPT), PDF, HTML e mais.
+- **Múltiplos Formatos**: Suporta Office (Word .docx/.doc, Excel, PPT), PDF, HTML e mais.
 - **Suporte nativo a Base64**: Envie arquivos diretamente via JSON.
 - **OCR Integrado**: Utiliza Tesseract OCR para ler texto de imagens e documentos escaneados localmente.
-- **Resiliência**: Detecção inteligente de extensões para arquivos mal formatados.
+- **Resiliência Legada**: Suporte a arquivos `.doc` antigos via Pandoc + Antiword.
 - **Segurança**: Proteção via API Key.
 
 ## 🚀 Como Executar

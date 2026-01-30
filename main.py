@@ -9,11 +9,12 @@ import mimetypes
 import pytesseract
 from PIL import Image
 import io
+import subprocess
 
 app = FastAPI(
     title="MarkItDown API",
     description="Converte qualquer documento suportado pelo MarkItDown em Markdown",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 # 🔐 API KEY via ENV
@@ -41,15 +42,39 @@ def run_ocr(contents: bytes) -> str:
     """Executa o OCR em uma imagem."""
     try:
         image = Image.open(io.BytesIO(contents))
-        # Tenta extrair texto em Português e Inglês
         text = pytesseract.image_to_string(image, lang='por+eng')
         return text.strip()
     except Exception as e:
         print(f"Erro no OCR: {e}")
         return ""
 
+def run_pandoc_conversion(input_path: str) -> str:
+    """Fallback para converter via Pandoc (especialmente arquivos .doc legados)."""
+    try:
+        # Tenta converter para markdown usando pandoc
+        # --from doc usa o antiword por baixo se for .doc binário
+        result = subprocess.run(
+            ["pandoc", input_path, "--from", "doc", "--to", "markdown"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        
+        # Se falhou como .doc, tenta detecção automática
+        result = subprocess.run(
+            ["pandoc", input_path, "--to", "markdown"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception as e:
+        print(f"Erro no Pandoc: {e}")
+    return ""
+
 def perform_conversion(contents: bytes, filename: str, mimetype: str):
-    """Lógica central de conversão usando MarkItDown e OCR como fallback."""
+    """Lógica central de conversão com fallbacks (MarkItDown -> Pandoc -> OCR)."""
     if len(contents) == 0:
         raise HTTPException(400, "Arquivo vazio")
 
@@ -63,18 +88,36 @@ def perform_conversion(contents: bytes, filename: str, mimetype: str):
     suffix = ext if ext.startswith(".") else f".{ext}" if ext else ""
     
     is_image = mimetype.startswith("image/") or ext in [".png", ".jpg", ".jpeg", ".tiff", ".bmp"]
+    is_legacy_word = ext == ".doc" or mimetype == "application/msword"
+    
     markdown = ""
+    method = "unknown"
 
-    # Tenta conversão via MarkItDown primeiro
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
         tmp_file.write(contents)
         tmp_path = tmp_file.name
 
     try:
-        result = md.convert(tmp_path)
-        markdown = result.text_content.strip() if result else ""
+        # Se for Word legado, Pandoc costuma ser melhor que MarkItDown
+        if is_legacy_word:
+            markdown = run_pandoc_conversion(tmp_path)
+            if markdown:
+                method = "pandoc"
+
+        # Tenta conversão via MarkItDown se não conseguimos via pandoc ou se não é doc legado
+        if not markdown:
+            try:
+                result = md.convert(tmp_path)
+                markdown = result.text_content.strip() if result else ""
+                if markdown:
+                    method = "markitdown"
+            except Exception:
+                # Se falhar e não for imagem, tentamos pandoc como último recurso antes de desistir
+                if not is_image:
+                    markdown = run_pandoc_conversion(tmp_path)
+                    if markdown:
+                        method = "pandoc"
     except Exception as e:
-        # Se falhar e for imagem, ignoramos o erro para tentar OCR abaixo
         if not is_image:
             raise HTTPException(
                 status_code=500,
@@ -84,16 +127,17 @@ def perform_conversion(contents: bytes, filename: str, mimetype: str):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    # Fallback para OCR se for imagem e o MarkItDown não retornou texto satisfatório
+    # Fallback para OCR se for imagem e nada funcionou
     if is_image and (not markdown or len(markdown) < 10):
         ocr_text = run_ocr(contents)
         if ocr_text:
             markdown = ocr_text
+            method = "ocr"
 
     if not markdown:
         raise HTTPException(
             status_code=422,
-            detail="Conversão concluída, mas nenhum texto foi extraído (Markdown vazio)"
+            detail="Conversão falhou: formato não suportado ou arquivo sem conteúdo extraível."
         )
 
     return {
@@ -101,7 +145,7 @@ def perform_conversion(contents: bytes, filename: str, mimetype: str):
         "content_type": mimetype,
         "size_bytes": len(contents),
         "markdown": markdown,
-        "method": "ocr" if is_image and not (result and result.text_content.strip()) else "markitdown"
+        "method": method
     }
 
 @app.post("/convert")
